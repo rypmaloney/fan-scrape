@@ -1,11 +1,12 @@
 import os
+import time
 import json
 import fandom
 import requests
 from tqdm import tqdm
 
-from postgres_helpers import insert_page
-from jdb_classes import FandomDatabase, FandomPage
+from postgres_helpers import insert_page, connect
+from jdb_classes import FandomDatabase, Page
 
 
 def get_all_pages(wiki_id):
@@ -43,46 +44,74 @@ def get_all_pages(wiki_id):
     return all_pages
 
 
-def scrape():
+def process_page_data(wrapped_page, page_id, json_db, text_file):
+    data = wrapped_page.content
+
+    # 1. Add to json database
+    db_page = Page(json_db, page_id)
+    db_page.set_content(data)
+
+    # 2. Add to Postgres database
+    sections = json.dumps(data.get("sections", None))
+    insert_page(page_id, data["title"], data["content"], sections)
+
+    # 3. Add to txt file
+    defintion = data["content"]
+    definition = defintion.replace("\n", " ").replace("\r", " ")
+    word_definition = f"{data['title']}:{definition}"
+    if not any(  # skip not useful entries
+        word in data["title"]
+        for word in [
+            "chapter",
+            "Chapter",
+            "Timeline",
+            "timeline",
+            "NE",
+        ]
+    ):
+        text_file.write(word_definition + "\n")
+
+
+def scrape(wiki_name, data_dir):
     """
     Pulls all pages from a Fandom wiki and stores three ways:
     1. txt file with word:summary pair to be converted into a dictionary.
     2. Json file for further processing.
-    3. Postgres databse. I'd rather not have to make repeat calls to the Fandom API.
+    3. Postgres database for persistent storage.
+
+    Parameters:
+    wiki_name (str): Name of the Fandom wiki to scrape.
+    data_dir (str): Directory to store the scraped data.
     """
-    fandom.set_wiki("wot")
+    fandom.set_wiki(wiki_name)
 
     print("Pulling all pages...")
-    all_pages = get_all_pages("wot")
+    all_pages = get_all_pages(wiki_name)
 
-    print("Initializing database...")
-    database = FandomDatabase("data")
-
-    print("Inserting page data....")
+    database = FandomDatabase(data_dir)
     cwd = os.getcwd()
+    txt_location = os.path.join(cwd, data_dir, "dictionary.txt")
 
-    txt_location = os.path.join(cwd, "data", "dictionary.txt")
     with open(txt_location, "w") as file:
 
         for page_id in tqdm(all_pages):
+            # Added rate limiting and retries
+            max_retries = 5
+            retry_wait_time = 60
+            retries = 0
 
-            wrapped_page = fandom.page(pageid=page_id)
-            data = wrapped_page.content
+            while True:
+                try:
+                    wrapped_page = fandom.page(pageid=page_id)
+                    tqdm.write(wrapped_page.title)
 
-            # 1. Add to json database
-            db_page = FandomPage(database, page_id)
-            db_page.set_content(data)
+                    process_page_data(wrapped_page, page_id, database, file)
+                    break
 
-            # 2. Add to Postgres database
-            if "sections" in data:
-                sections = json.dumps(data["sections"], indent=4)
-            else:
-                sections = None
-            insert_page(page_id, data["title"], data["content"], sections)
-
-            # 3. Add to txt file
-            defintion = data["content"]
-            definition = defintion.replace("\n", " ").replace("\r", " ")
-            word_defintion = f"{data['title']}:{definition}"
-
-            file.write(word_defintion + "\n")
+                except Exception:
+                    retries += 1
+                    if retries > max_retries:
+                        tqdm.write(f"Too many retries, giving up on {page_id}")
+                        break
+                    tqdm.write("Waiting to retry...")
+                    time.sleep(retry_wait_time)

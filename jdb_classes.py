@@ -1,8 +1,6 @@
 import json
 import os
 
-from fandom import FandomPage
-
 
 class FandomDatabase(object):
     def __init__(self, directory, cwd=None):
